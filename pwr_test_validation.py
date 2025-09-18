@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 """
 - Model 1: one temperature per lattice unit (17x17) -> input saved shape (n_runs,17,17)
 - Model 2: two temperatures per lattice unit (fuel, other) -> input saved shape (n_runs,17,17,2)
@@ -83,10 +84,22 @@ def finite_bbox(root):
     return tuple(ll), tuple(ur)
 
 def calculate_keff_direct(A, Fvec):
-    F = np.array(Fvec).flatten()
-    F = F / (np.sum(F) + 1e-16)
+    N, _ = A.shape
+    F = np.ones((N,1))/float(N)
     AF = A @ F
-    return float(np.dot(F, AF) / np.dot(F, F))
+    dk = 1.0
+    keff_old = 10
+    i_iter = 0
+    while i_iter < 500 and dk > 1e-5:
+        i_iter += 1
+        print(i_iter)
+        F_new = A.dot(F)
+        keff = F_new.max() 
+        F = F_new/keff
+        dk = np.abs(keff/keff_old-1)
+        keff_old = keff
+        
+    return keff, F_new
 
 def extract_keff_comprehensive(sp, run_dir, run_idx):
     keff_value = None
@@ -329,7 +342,7 @@ for run_idx in range(n_runs):
 
     # helper: evaluate operator
     def evaluate_operator(Aop):
-        keff_ray = calculate_keff_direct(Aop, P)
+        keff_ray, F = calculate_keff_direct(Aop, P)
         res_norm = np.linalg.norm(Aop @ P - keff_value * P)
         rel_err = abs(keff_value - keff_ray) / (abs(keff_value) + 1e-20)
         return keff_ray, res_norm, rel_err
@@ -418,7 +431,7 @@ for idx in range(n_runs):
             validation_errors.append(f"Run {idx+1}: k_eff extraction failed")
             continue
 
-        keff_solved = calculate_keff_direct(A_op, Pj)
+        keff_solved, F = calculate_keff_direct(A_op, Pj)
         if keff_openmc != 0:
             rel_error = abs(keff_openmc - keff_solved) / abs(keff_openmc)
             print(f"OpenMC k_eff: {keff_openmc:.6f}")
