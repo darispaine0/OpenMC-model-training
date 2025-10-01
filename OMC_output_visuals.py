@@ -2,11 +2,16 @@
 """
 Visualize Fission Matrix Training Data
 Displays temperature inputs, fission source, and fission matrix
+
+Changes:
+- Source colorbar spans only min/max of fuel cells (ignores zeros from guide tubes)
+- Fission matrix applies cutoff (default 1e-4) and uses LogNorm so tiny values do not dominate colormap
 """
 
 import numpy as np
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+from matplotlib.colors import LogNorm
 
 def load_data():
     """Load all saved data files."""
@@ -17,26 +22,73 @@ def load_data():
     
     return input_temps, output_source, output_fm_normalized, output_keff
 
-def visualize_run(run_idx, input_temps, output_source, output_fm, keff):
-    """Visualize data for a specific run."""
-    
+def _safe_keff_value(k):
+    """Return a float-like representation of keff for display."""
+    try:
+        # openmc-style object with nominal_value
+        if hasattr(k, "nominal_value"):
+            return float(k.nominal_value)
+        # numpy scalar or float
+        if np.isscalar(k):
+            return float(k)
+        # array-like
+        arr = np.array(k)
+        if arr.size == 1:
+            return float(arr.squeeze())
+    except Exception:
+        pass
+    return float("nan")
+
+def visualize_run(run_idx, input_temps, output_source, output_fm, keff, fm_cutoff=1e-4):
+    """Visualize data for a specific run.
+
+    fm_cutoff: values below this are masked/omitted in the log plot.
+    """
     # Convert to proper numpy arrays if needed
     temps = np.array(input_temps[run_idx], dtype=float)
-    source = np.array(output_source[run_idx], dtype=float).reshape(17, 17)
+    source_flat = np.array(output_source[run_idx], dtype=float).ravel()
+    # infer mesh size from source length (must be perfect square)
+    n_cells = int(np.round(np.sqrt(source_flat.size)))
+    if n_cells * n_cells != source_flat.size:
+        raise ValueError(f"Source array length {source_flat.size} is not a perfect square.")
+    source = source_flat.reshape((n_cells, n_cells))
+    
     fm = np.array(output_fm[run_idx], dtype=float)
+    # fm can be either (n^2, n^2) or flattened; try to handle both
+    try:
+        if fm.ndim == 1:
+            # flatten to n_mesh*n_mesh expected
+            expected = n_cells * n_cells
+            if fm.size == expected * expected:
+                fm = fm.reshape((expected, expected))
+            else:
+                # try to make a square from length
+                side = int(np.round(np.sqrt(fm.size)))
+                if side * side == fm.size:
+                    fm = fm.reshape((side, side))
+                else:
+                    raise ValueError("Unexpected fm shape/size.")
+        elif fm.ndim == 2:
+            pass
+        else:
+            raise ValueError("Unexpected fm ndim.")
+    except Exception as e:
+        raise RuntimeError(f"Cannot interpret fm data: {e}")
+    
     k = keff[run_idx]
+    k_val = _safe_keff_value(k)
     
     # Determine if single or dual temperature model
-    is_dual_temp = (temps.ndim == 3)
+    is_dual_temp = (temps.ndim == 3 and temps.shape[2] >= 2)
     
-    # Create figure layout
+    # Create figure layout (use constrained_layout to avoid overlaps)
     if is_dual_temp:
-        fig = plt.figure(figsize=(20, 5))
+        fig = plt.figure(figsize=(20, 5), constrained_layout=True)
         gs = GridSpec(1, 4, figure=fig, wspace=0.3)
     else:
-        fig = plt.figure(figsize=(16, 5))
+        fig = plt.figure(figsize=(16, 5), constrained_layout=True)
         gs = GridSpec(1, 3, figure=fig, wspace=0.3)
-    
+
     # Plot temperature(s)
     if is_dual_temp:
         # Fuel temperature
@@ -76,27 +128,59 @@ def visualize_run(run_idx, input_temps, output_source, output_fm, keff):
         ax3 = fig.add_subplot(gs[0, 1])
         source_plot_idx = 1
     
-    # Plot fission source
+    # --- Fission source plotting ---
+    # Determine vmin/vmax based on "fuel" cells only (exclude zeros/guide tubes)
+    source_positive = source[source > 0.0]
+    if source_positive.size == 0:
+        # no positive entries (degenerate) -> fallback to full range
+        vmin, vmax = float(source.min()), float(source.max())
+    else:
+        vmin, vmax = float(source_positive.min()), float(source_positive.max())
+        # if vmin==vmax, expand a little for color mapping
+        if vmin == vmax:
+            vmin = vmin * 0.999 if vmin != 0 else -1e-8
+            vmax = vmax * 1.001 if vmax != 0 else 1e-8
+    
     im3 = ax3.imshow(source, cmap='viridis', interpolation='nearest',
-                    origin='lower', aspect='equal')
-    ax3.set_title(f'Fission Source Distribution\nk-eff = {k.nominal_value:.5f}')
+                    origin='lower', aspect='equal', vmin=vmin, vmax=vmax)
+    ax3.set_title(f'Fission Source Distribution\nk-eff = {np.nan if np.isnan(k_val) else k_val:.5f}')
     ax3.set_xlabel('Column')
     ax3.set_ylabel('Row')
-    plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+    cbar3 = plt.colorbar(im3, ax=ax3, fraction=0.046, pad=0.04)
+    cbar3.set_label('Source (fuel-only scaling)')
     
-    # Plot fission matrix
+    # --- Fission matrix plotting ---
     ax4 = fig.add_subplot(gs[0, source_plot_idx + 1])
-    # Filter out zeros for log scale
-    fm_plot = np.where(fm > 0, fm, np.nan)
-    im4 = ax4.imshow(fm_plot, cmap='plasma', interpolation='nearest',
-                    origin='lower', aspect='equal', norm='log')
-    ax4.set_title('Fission Matrix (289×289)\nlog scale')
+    # Apply cutoff: mask values below cutoff (these will appear blank)
+    cutoff = fm_cutoff
+    fm_plot = np.array(fm, dtype=float)
+    # For log plotting we must have positive vmin; mask values below cutoff
+    fm_masked = np.where(fm_plot >= cutoff, fm_plot, np.nan)
+    
+    # find a vmax for color scale among values >= cutoff
+    if np.isfinite(fm_masked).any():
+        vmax_fm = np.nanmax(fm_masked)
+        # Ensure vmax_fm > cutoff
+        if vmax_fm <= cutoff:
+            vmax_fm = cutoff * 10.0
+        norm = LogNorm(vmin=cutoff, vmax=vmax_fm)
+        im4 = ax4.imshow(fm_masked, cmap='plasma', interpolation='nearest',
+                         origin='lower', aspect='equal', norm=norm)
+        cbar4 = plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
+        cbar4.set_label('Transfer Probability (cutoff {:.1e})'.format(cutoff))
+    else:
+        # If everything is below cutoff, draw the raw matrix but gray it out
+        im4 = ax4.imshow(fm_plot, cmap='plasma', interpolation='nearest',
+                         origin='lower', aspect='equal')
+        cbar4 = plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04)
+        cbar4.set_label('Transfer Probability (no values above cutoff)')
+    
+    ax4.set_title('Fission Matrix (n×n)\nlog scale (masked small values)')
     ax4.set_xlabel('Source Cell Index')
     ax4.set_ylabel('Destination Cell Index')
-    plt.colorbar(im4, ax=ax4, fraction=0.046, pad=0.04, label='Transfer Probability')
     
-    plt.suptitle(f'BEAVRS Assembly Data - Run {run_idx+1}', 
-                fontsize=16, y=1.02)
+    plt.suptitle(f'BEAVRS Assembly Data - Run {run_idx+1}', fontsize=16)
+
     
     return fig
 
