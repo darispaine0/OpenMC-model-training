@@ -4,6 +4,15 @@ Fission Matrix Testing with OpenMC BEAVRS Assembly
 Compares fission matrix eigenvalue and eigenvector with OpenMC reference
 """
 
+"""
+For local environment:
+1: conda activate openmc-env
+2: cd ~/Monte_Carlo/Test
+3: export OPENMC_CROSS_SECTIONS=/mnt/c/Users/Daris/Downloads/endfb80/endfb-viii.0-hdf5/cross_sections.xml
+# optional but nice:
+export OPENMC_DATA=/mnt/c/Users/Daris/Downloads/endfb80/endfb-viii.0-hdf5
+"""
+
 import numpy as np
 import openmc
 import matplotlib.pyplot as plt
@@ -17,22 +26,47 @@ def ask_int(prompt, default):
         return default
 
 def material_has_uranium(mat):
+    """Check if material contains uranium using multiple methods."""
+    # Method 1: Check material name
     try:
-        if mat.get_nuclide_atom_fraction("U234") or mat.get_nuclide_atom_fraction("U235") or mat.get_nuclide_atom_fraction("U238"):
-            return True
+        if hasattr(mat, 'name') and mat.name:
+            name_lower = mat.name.lower()
+            if 'fuel' in name_lower or 'uo2' in name_lower:
+                return True
     except Exception:
         pass
+    
+    # Method 2: Check using get_nuclides() 
     try:
-        keys = list(mat.nuclides.keys())
+        nuclides = mat.get_nuclides()
+        for nuclide in nuclides:
+            if 'U' in str(nuclide):
+                return True
     except Exception:
-        keys = []
-    for k in keys:
-        ks = str(k)
-        if "U234" in ks or "U235" in ks or "U238" in ks:
-            return True
-        if re.search(r"9223(4|5|8)", ks):
-            return True
+        pass
+    
+    # Method 3: Check nuclides list directly
+    try:
+        if hasattr(mat, 'nuclides') and mat.nuclides:
+            for nuclide_tuple in mat.nuclides:
+                nuclide_str = str(nuclide_tuple[0])
+                if 'U234' in nuclide_str or 'U235' in nuclide_str or 'U238' in nuclide_str:
+                    return True
+                if re.search(r'U\d+', nuclide_str):  # Any uranium isotope
+                    return True
+    except Exception:
+        pass
+    
+    # Method 4: Try get_nuclide_atom_fraction
+    try:
+        for isotope in ['U234', 'U235', 'U238']:
+            if mat.get_nuclide_atom_fraction(isotope) > 0:
+                return True
+    except Exception:
+        pass
+    
     return False
+
 
 def main():
     modelnum = ask_int("Which model to run? (1 = single-temp/unit, 2 = fuel/non-fuel two-temperatures): ", 1)
@@ -40,19 +74,23 @@ def main():
     particles = ask_int("Particles per batch (e.g. 1000): ", 1000)
     temp_min = ask_int("Min random temp (K): ", 300)
     temp_max = ask_int("Max random temp (K): ", 900)
-    PlotInput = input("Show FM plots (Y/N): ")
+    PlotInput = input("Show plots (Y/N): ")
 
     input_file = "input_temps.npy"
     output_source_file = "output_source.npy"   # per-run mesh fission source (pj)
     output_fm_raw_file = "output_fm_raw.npy"   # raw fm arrays from tallies (flattened)
     output_fm_file = "output_fm_normalized.npy" # normalized FM used for validation
     output_keff_file = "output_keff.npy"
+    output_keff_uncertainty = "output_keff_uncertainty.npy"
+    output_source_uncertainty = "output_source_uncertainty.npy"
 
     input_data = []
     source_data = []
     fm_raw_data = []
     fm_normalized_data = []
     keff_data = []
+    source_uncertainty_data = []
+    keff_uncertainty_data = []
     
     n_rows = 17
     n_cols = 17
@@ -105,6 +143,7 @@ def main():
                             mat = cell.fill
                             if material_has_uranium(mat):
                                 assigned_fuel = float(temps[i, j, 0])
+                                print("Uranium Detected")
                                 cell.temperature = assigned_fuel
                             else:
                                 assigned_other = float(temps[i, j, 1])
@@ -155,7 +194,9 @@ def main():
         print("Analyzing results...")
         with openmc.StatePoint(filepath='statepoint.100.h5') as output:
             keff = output.keff
+            keff_mean, keff_std = openmc.lib.keff()
             keff_data.append(keff)
+            keff_uncertainty_data.append(keff_std/keff_mean)
             source_tally = output.get_tally(name='Fission source')
             fm_tally = output.get_tally(name='Fission matrix')
         
@@ -166,6 +207,11 @@ def main():
         fm_std = fm_tally.std_dev.squeeze()
         fm_raw_data.append(fm_raw)
         source_data.append(source)
+
+        #Relative Uncertainty
+        Source_rel_un = np.divide(source_std, source, out=np.zeros_like(source_std), where=source!=0).reshape(n_rows, n_cols)
+
+        source_uncertainty_data.append(Source_rel_un)
 
         # Build fission matrix
         print("Building fission matrix...")
@@ -223,26 +269,45 @@ def main():
         if PlotInput == "Y":
             print("Creating comparison plot...")
             plt.rcParams['font.size'] = 15
-            fig, ax = plt.subplots(figsize=(12, 9))
-            im = ax.imshow(source_rel_diff*100, cmap='jet', interpolation='nearest', 
-                        origin='lower', aspect='equal')
+
+            fig, axes = plt.subplots(1, 2, figsize=(20, 9))  # Two side-by-side plots
+
+            # ---- Plot 1: Fission Source Relative Difference ----
+            im1 = axes[0].imshow(source_rel_diff * 100, cmap='jet', interpolation='nearest', 
+                                origin='lower', aspect='equal')
             
-            ax.set_xticks(range(N_pins))
-            ax.set_yticks(range(N_pins))
-            ax.set_xticklabels(range(1, N_pins+1))
-            ax.set_yticklabels(range(1, N_pins+1))
-            ax.grid(which='minor', color='w', linestyle='-', linewidth=0.5, alpha=0.6)
-            ax.tick_params(which='minor', bottom=False, left=False)
+            axes[0].set_xticks(range(N_pins))
+            axes[0].set_yticks(range(N_pins))
+            axes[0].set_xticklabels(range(1, N_pins + 1))
+            axes[0].set_yticklabels(range(1, N_pins + 1))
+            axes[0].grid(which='minor', color='w', linestyle='-', linewidth=0.5, alpha=0.6)
+            axes[0].tick_params(which='minor', bottom=False, left=False)
+
+            cbar1 = fig.colorbar(im1, ax=axes[0], fraction=0.046, pad=0.04)
+            cbar1.set_label('Fission source relative difference (%)')
             
-            # Colorbar
-            cbar = fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
-            cbar.set_label('Fission source relative difference (%)')
+            axes[0].set_title(f'Fission Source - Relative Difference (Run {run_idx+1})')
+
+            # ---- Plot 2: Fission Source Relative Uncertainty ----
+            # Assuming Source_rel_un is already computed as relative uncertainty (std / mean)
+            im2 = axes[1].imshow(Source_rel_un * 100, cmap='jet', interpolation='nearest',
+                                origin='lower', aspect='equal')
             
-            # Set title
-            ax.set_title(f'Fission source in BEAVRS assembly - FM vs. OpenMC (Run {run_idx+1})')
+            axes[1].set_xticks(range(N_pins))
+            axes[1].set_yticks(range(N_pins))
+            axes[1].set_xticklabels(range(1, N_pins + 1))
+            axes[1].set_yticklabels(range(1, N_pins + 1))
+            axes[1].grid(which='minor', color='w', linestyle='-', linewidth=0.5, alpha=0.6)
+            axes[1].tick_params(which='minor', bottom=False, left=False)
+
+            cbar2 = fig.colorbar(im2, ax=axes[1], fraction=0.046, pad=0.04)
+            cbar2.set_label('Fission source relative uncertainty (%)')
             
+            axes[1].set_title(f'Fission Source - Relative Uncertainty (Run {run_idx+1})')
+
             plt.tight_layout()
             plt.show()
+
             
         print(f'Analysis {run_idx+1} complete!')
     
@@ -253,7 +318,8 @@ def main():
     np.save(output_fm_raw_file, np.array(fm_raw_data, dtype=object))
     np.save(output_fm_file, np.array(fm_normalized_data, dtype=object))
     np.save(output_keff_file, np.array(keff_data, dtype=object))
-    
+    np.save(output_keff_uncertainty, np.array(keff_uncertainty_data, dtype=object))
+    np.save(output_source_uncertainty, np.array(source_uncertainty_data, dtype=object))
     print("All runs complete and data saved!")
 
 if __name__ == "__main__":
